@@ -20,6 +20,24 @@ let page : string -> string =
 
   fun page_name -> Hashtbl.find table (page_name ^ ".html")
 
+let xml_page page_name =
+  read_file (Filename.concat "xml" (page_name ^ ".xml"))
+
+let parse_xml ?(report = fun _ _ -> ()) text =
+  text
+  |> Markup.string
+  |> Markup.parse_xml ~report
+  |> Markup.signals
+  |> from_signals
+
+let string_contains s sub =
+  let rec loop index =
+    if index + String.length sub > String.length s then false
+    else if String.sub s index (String.length sub) = sub then true
+    else loop (index + 1)
+  in
+  loop 0
+
 let suites = [
   "lambdasoup" >::: [
     ("normal_return" >:: fun _ ->
@@ -1181,6 +1199,172 @@ let suites = [
 
       assert_bool "equal" (equal (parse document1) (parse document2));
       assert_bool "equal" (equal (parse document1) (parse document3)));
+
+    ("xml-extraction" >:: fun _ ->
+      let soup = xml_page "atom" |> parse_xml in
+
+      (* Prefixed element: qualified name, prefix, URI, plain attributes. *)
+      let self = soup $ "atom:link[rel=self]" in
+      assert_equal (name self) "atom:link";
+      assert_equal (prefix self) (Some "atom");
+      assert_equal (namespace self) (Some "http://www.w3.org/2005/Atom");
+      assert_equal (attribute "rel" self) (Some "self");
+      assert_equal (attribute "href" self) (Some "http://example.org/feed.atom");
+
+      (* Default namespace: URI is set, but there is no prefix. *)
+      let title = soup $ "feed > title" in
+      assert_equal (name title) "title";
+      assert_equal (prefix title) None;
+      assert_equal (namespace title) (Some "http://www.w3.org/2005/Atom");
+
+      let feed = soup $ "feed" in
+      assert_equal (prefix feed) None;
+      assert_equal (namespace feed) (Some "http://www.w3.org/2005/Atom");
+      assert_equal (attribute "xml:lang" feed) (Some "en");
+
+      (* A bare type selector matches the local name in any namespace. A
+         qualified selector resolves the prefix against the [xmlns]
+         declarations in scope at each candidate element; [xmlns:atom] is
+         only in scope for the <atom:link> element itself. *)
+      assert_equal ~printer:string_of_int (soup $$ "link" |> count) 3;
+      assert_equal ~printer:string_of_int (soup $$ "atom:link" |> count) 1;
+      assert_equal ~printer:string_of_int (soup $$ "atom|link" |> count) 1;
+
+      let entry_link = soup $ "entry link" in
+      assert_equal (attribute "rel" entry_link) (Some "alternate");
+      assert_equal
+        (attribute "href" entry_link)
+        (Some "http://example.org/2003/12/13/atom03");
+
+      (* tags follows the same matching rules as selectors. *)
+      assert_equal ~printer:string_of_int (soup |> tags "link" |> count) 3;
+      assert_equal ~printer:string_of_int
+        (soup |> tags "atom:link" |> count) 1);
+
+    ("xml-rss" >:: fun _ ->
+      let soup = xml_page "rss" |> parse_xml in
+
+      let encoded = soup $ "content:encoded" in
+      assert_equal (name encoded) "content:encoded";
+      assert_equal (prefix encoded) (Some "content");
+      assert_equal
+        (namespace encoded)
+        (Some "http://purl.org/rss/1.0/modules/content/");
+      assert_equal (leaf_text encoded) (Some "<p>Full text</p>");
+
+      (* RSS itself uses no namespaces. *)
+      assert_equal (soup $ "channel" |> namespace) None;
+      assert_equal (soup $ "channel" |> prefix) None;
+      assert_equal ~printer:string_of_int (soup $$ "item link" |> count) 1;
+      assert_equal
+        (soup $ "item link" |> leaf_text) (Some "http://example.org/item");
+
+      (* A prefix that is not declared in the document matches nothing. *)
+      assert_equal ~printer:string_of_int (soup $$ "atom:encoded" |> count) 0);
+
+    ("xml-round-trip" >:: fun _ ->
+      let round_trip page_name =
+        let soup = xml_page page_name |> parse_xml in
+        let output = soup |> signals |> Markup.write_xml |> Markup.to_string in
+        let reparsed = parse_xml output in
+        assert_bool
+          (page_name ^ ": round-trip not equal") (equal soup reparsed);
+        output
+      in
+
+      let atom_output = round_trip "atom" in
+      assert_bool "atom:link preserved"
+        (string_contains atom_output "atom:link");
+      assert_equal ~printer:string_of_int
+        (parse_xml atom_output $$ "atom:link" |> count) 1;
+
+      let rss_output = round_trip "rss" in
+      assert_bool "content:encoded preserved"
+        (string_contains rss_output "content:encoded");
+
+      let unbound_output = round_trip "unbound" in
+      assert_bool "unbound prefix preserved"
+        (string_contains unbound_output "atom:link"));
+
+    ("xml-duplicate-attributes" >:: fun _ ->
+      let errors = ref [] in
+      let soup =
+        xml_page "duplicates" |> parse_xml ~report:(fun _ e ->
+          errors := e::!errors)
+      in
+
+      (* The XML parser reports duplicates and keeps the first occurrence,
+         both for literally repeated attributes and for attributes that are
+         duplicates only after namespace expansion. *)
+      assert_bool "duplicate reported"
+        (List.exists
+          (fun e -> match e with `Bad_token _ -> true | _ -> false)
+          !errors);
+
+      let item = soup $ "item" in
+      assert_equal (attribute "id" item) (Some "first");
+      assert_equal (attribute "p:attr" item) (Some "1");
+      assert_equal (attribute "q:attr" item) None);
+
+    ("xml-unbound-prefix" >:: fun _ ->
+      let errors = ref [] in
+      let soup =
+        xml_page "unbound" |> parse_xml ~report:(fun _ e ->
+          errors := e::!errors)
+      in
+
+      assert_bool "Bad_namespace reported"
+        (List.exists (fun e -> e = `Bad_namespace "atom") !errors);
+
+      (* The qualified name is still usable for selection and access. *)
+      let link = soup $ "atom:link" in
+      assert_equal (name link) "atom:link";
+      assert_equal (prefix link) (Some "atom");
+      assert_equal (namespace link) None;
+      assert_equal (attribute "href" link) (Some "http://example.org/"));
+
+    ("xml-malformed" >:: fun _ ->
+      let errors = ref [] in
+      let soup =
+        xml_page "broken" |> parse_xml ~report:(fun _ e ->
+          errors := e::!errors)
+      in
+
+      assert_bool "errors reported" (!errors <> []);
+      (* The parser recovers; well-formed content is still accessible. *)
+      assert_equal (soup $ "title" |> leaf_text) (Some "Broken"));
+
+    ("xml-selector-errors" >:: fun _ ->
+      let soup = xml_page "atom" |> parse_xml in
+      let test selector =
+        (try
+          soup |> select selector |> ignore; false
+        with
+        | Soup.Parse_error _ -> true
+        | _ -> false) |> assert_bool ("expected Parse_error: " ^ selector)
+      in
+
+      test "atom:";
+      test "atom|";
+      test "|";
+      test "atom::link";
+
+      (* Known pseudo-classes after a type selector keep their meaning. *)
+      assert_equal ~printer:string_of_int (soup $$ "entry:title" |> count) 0;
+      assert_equal ~printer:string_of_int
+        (soup $$ "entry > title:first-child" |> count) 1);
+
+    ("html-colon-names" >:: fun _ ->
+      (* In HTML, colons in tag and attribute names are literal. *)
+      let soup = parse "<atom:link href='x'></atom:link>" in
+      let link = soup $ "atom:link" in
+      assert_equal (attribute "href" link) (Some "x");
+      assert_equal (namespace link) None;
+      assert_equal
+        (link |> to_string) "<atom:link href=\"x\"></atom:link>";
+
+      let soup = parse "<p xml:lang='en'></p>" in
+      assert_equal (soup $ "p" |> attribute "xml:lang") (Some "en"));
   ]
 ]
 

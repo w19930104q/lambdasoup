@@ -33,9 +33,18 @@ type element = unit
 type general = unit
 type soup = unit
 
+(* An element or attribute name, decomposed into its namespace URI, the prefix
+   as it was written in the source (if any), and the local name. The namespace
+   URI is [""] when the name is not in any namespace. HTML elements parsed by
+   [Soup.parse] are treated as having no namespace. *)
+type expanded_name =
+  {ns     : string;
+   prefix : string option;
+   local  : string}
+
 type element_values =
-  {mutable name       : string;
-   mutable attributes : (string * string) list;
+  {mutable name       : expanded_name;
+   mutable attributes : (expanded_name * string) list;
    mutable children   : general node list}
 
 and document_values =
@@ -65,6 +74,29 @@ let forget_type : (_ node) -> (_ node) =
 
 let coerce node = forget_type node
 
+let index_opt s c =
+  try Some (String.index s c)
+  with Not_found -> None
+
+let split_qualified_name s =
+  match index_opt s ':' with
+  | Some colon when colon > 0 ->
+    Some (String.sub s 0 colon,
+          String.sub s (colon + 1) (String.length s - colon - 1))
+  | _ -> None
+
+let expanded_name_of_string s =
+  match split_qualified_name s with
+  | Some (prefix, local) ->
+    {ns = ""; prefix = Some prefix; local}
+  | None ->
+    {ns = ""; prefix = None; local = s}
+
+let qualified_name {prefix; local; _} =
+  match prefix with
+  | Some prefix -> prefix ^ ":" ^ local
+  | None -> local
+
 let create_element name attributes children =
   let values = {name; attributes; children} in
   let node = {self = None; parent = None; values = `Element values} in
@@ -86,29 +118,126 @@ let create_document doctype roots =
 
 let create_soup () = create_document None []
 
+(* Prefixes that are always in scope, mirroring Markup.ml and common practice.
+   They are used to recover prefixes for names whose namespace URI is not
+   declared by any [xmlns] attribute in the signal stream itself. *)
+let well_known_namespaces =
+  ["xml", Markup.Ns.xml;
+   "xmlns", Markup.Ns.xmlns;
+   "xlink", Markup.Ns.xlink]
+
+let looks_like_uri s =
+  String.contains s ':' || String.contains s '/'
+
+let deduplicate_attributes attributes =
+  let rec loop seen acc = function
+    | [] -> List.rev acc
+    | ((name, _) as attribute)::rest ->
+      let key = (name.ns, name.local) in
+      if List.mem key seen then loop seen acc rest
+      else loop (key::seen) (attribute::acc) rest
+  in
+  loop [] [] attributes
+
 let from_signals' ~map_attributes signals =
   let doctype = ref None in
-  signals
-  |> Markup.map (fun s ->
-    begin match s with
-    | `Doctype d -> doctype := Some d
-    | _ -> ()
-    end;
-    s)
-  |> (fun s -> Markup.trees
-    ~text:(fun ss -> create_text (String.concat "" ss))
-    ~element:(fun name attributes children ->
-      let attributes =
-        attributes
-        |> List.map (fun ((ns, n), v) ->
-          match ns with
-          | "" -> (n, v)
-          | _ -> (ns ^ ":" ^ n, v))
-        |> map_attributes name in
-      create_element (snd name) attributes children)
-    s)
-  |> Markup.to_list
-  |> create_document !doctype
+  let roots = ref [] in
+  (* Stack of open elements. Each frame holds the element's expanded name, its
+     attributes, its accumulated children (in reverse order), and the namespace
+     context to restore when the element is closed. *)
+  let stack = ref [] in
+  let namespace_context = ref well_known_namespaces in
+
+  let lookup_prefix uri =
+    let rec loop = function
+      | [] -> None
+      | (prefix, uri')::rest ->
+        if uri' = uri then Some prefix else loop rest
+    in
+    loop !namespace_context
+  in
+
+  let expand_name (ns, local) =
+    (* The HTML namespace is treated as "no namespace" internally, so that
+       HTML documents behave exactly as before. *)
+    let ns = if ns = Markup.Ns.html then "" else ns in
+    if ns = "" then {ns; prefix = None; local}
+    else
+      match lookup_prefix ns with
+      | Some "" -> {ns; prefix = None; local}
+      | Some prefix -> {ns; prefix = Some prefix; local}
+      | None ->
+        (* The parser could not resolve the prefix, and left it in place of
+           the namespace URI (see [`Bad_namespace] in Markup.ml). Treat the
+           name as an unnamespaced qualified name, so that it round-trips
+           through [signals] unchanged. *)
+        if looks_like_uri ns then {ns; prefix = None; local}
+        else {ns = ""; prefix = Some ns; local}
+  in
+
+  let expand_attribute_name (ns, local) =
+    if ns = Markup.Ns.xmlns then
+      if local = "xmlns" then {ns; prefix = None; local}
+      else {ns; prefix = Some "xmlns"; local}
+    else expand_name (ns, local)
+  in
+
+  let attach node =
+    match !stack with
+    | [] -> roots := node::!roots
+    | (_, _, children, _)::_ -> children := node::!children
+  in
+
+  let rec loop () =
+    match Markup.next signals with
+    | None -> ()
+    | Some signal ->
+      begin match signal with
+      | `Start_element (name, attributes) ->
+        let previous_context = !namespace_context in
+        let bindings =
+          attributes |> List.fold_left (fun bindings ((ns, local), uri) ->
+            if ns <> Markup.Ns.xmlns then bindings
+            else if local = "xmlns" then ("", uri)::bindings
+            else (local, uri)::bindings)
+            []
+        in
+        namespace_context := (List.rev bindings) @ !namespace_context;
+        let name = expand_name name in
+        let attributes =
+          attributes |> List.map (fun (name, value) ->
+            expand_attribute_name name, value)
+        in
+        stack := (name, attributes, ref [], previous_context)::!stack
+
+      | `End_element ->
+        begin match !stack with
+        | [] -> () (* Stray end tag; ignore. *)
+        | (name, attributes, children, previous_context)::rest ->
+          namespace_context := previous_context;
+          stack := rest;
+          let attributes =
+            attributes |> deduplicate_attributes |> map_attributes name in
+          let element =
+            create_element name attributes (List.rev !children) in
+          attach element
+        end
+
+      | `Text ss ->
+        attach (create_text (String.concat "" ss))
+
+      | `Doctype d ->
+        doctype := Some d
+
+      | `Xml _
+      | `PI _
+      | `Comment _ ->
+        ()
+      end;
+      loop ()
+  in
+  loop ();
+  create_document !doctype (List.rev !roots)
 
 let from_signals =
   from_signals' ~map_attributes:(fun _n a -> a)
@@ -127,9 +256,13 @@ let parse text =
   |> from_signals'
     ~map_attributes:(fun name attributes ->
       match name with
-      | ns, "body" when ns = Markup.Ns.html ->
+      | {ns = ""; local = "body"; _} ->
         List.fold_left (fun attributes (n, v) ->
-          match List.mem_assoc n attributes with
+          let n = expanded_name_of_string n in
+          match
+            List.exists
+              (fun (n', _) -> n'.ns = n.ns && n'.local = n.local) attributes
+          with
           | true -> attributes
           | false -> (n, v)::attributes
         ) attributes !body_attributes
@@ -178,21 +311,48 @@ let with_stop f =
       failwith "Soup.with_stop: internal error: !result = None" [@coverage off]
     | Some v -> v
 
-let name = function
-  | {values = `Element {name; _}; _} -> String.lowercase_ascii name
-  | _ -> failwith "Soup.name: internal error: not an element" [@coverage off]
+let element_name_values = function
+  | {values = `Element {name; _}; _} -> name
+  | _ ->
+    failwith "Soup.element_name_values: internal error: not an element"
+      [@coverage off]
 
-let fold_attributes f init = function
+let name node =
+  node |> element_name_values |> qualified_name |> String.lowercase_ascii
+
+let namespace node =
+  match (element_name_values node).ns with
+  | "" -> None
+  | ns -> Some ns
+
+let prefix node =
+  (element_name_values node).prefix
+
+let fold_attributes_expanded f init = function
   | {values = `Element {attributes; _}; _} ->
     attributes |> List.fold_left (fun v (name, value) -> f v name value) init
   | _ ->
     failwith "Soup.fold_attributes: internal error: not an element"
       [@coverage off]
 
+let fold_attributes f init node =
+  node |> fold_attributes_expanded (fun v name value ->
+    f v (qualified_name name) value) init
+
+let attribute_name_matches s {ns; prefix; local} =
+  (ns = "" && local = s)
+  ||
+  (match prefix with
+  | Some prefix -> prefix ^ ":" ^ local = s
+  | None -> false)
+  ||
+  (ns <> "" && ns ^ ":" ^ local = s)
+
 let attribute name node =
   with_stop (fun stop ->
-    node |> fold_attributes (fun _ name' value ->
-      if name' = name then stop.throw (Some value) else None)
+    node |> fold_attributes_expanded (fun _ name' value ->
+      if attribute_name_matches name name' then stop.throw (Some value)
+      else None)
       None)
 
 let has_attribute name node =
@@ -222,6 +382,70 @@ let classes node =
   | Some classes -> split_attribute classes
 
 let id = attribute "id"
+
+(* Resolves [prefix] to a namespace URI using the [xmlns] attributes in scope
+   at [node], i.e. its own attributes and those of its ancestors. *)
+let rec resolve_prefix_in node prefix =
+  let xmlns_local = if prefix = "" then "xmlns" else prefix in
+  match node with
+  | None -> None
+  | Some node ->
+    match node.values with
+    | `Element {attributes; _} ->
+      let rec scan = function
+        | [] -> None
+        | (name, uri)::rest ->
+          if name.ns = Markup.Ns.xmlns && name.local = xmlns_local then
+            Some uri
+          else scan rest
+      in
+      begin match scan attributes with
+      | Some _ as result -> result
+      | None -> resolve_prefix_in node.parent prefix
+      end
+    | _ -> resolve_prefix_in node.parent prefix
+
+let resolve_prefix node prefix =
+  match resolve_prefix_in (Some node) prefix with
+  | Some _ as result -> result
+  | None ->
+    let rec scan = function
+      | [] -> None
+      | (prefix', uri)::rest ->
+        if prefix' = prefix then Some uri else scan rest
+    in
+    scan well_known_namespaces
+
+(* CSS type selectors. [Name] is a bare local name, which matches elements in
+   any namespace (CSS behavior when no default namespace is declared).
+   [Qualified (prefix, local)] matches a prefix and local name; the prefix is
+   resolved against the document's [xmlns] declarations where possible.
+   [No_namespace] matches only elements that are not in any namespace. *)
+type type_selector =
+  | Universal
+  | Name of string
+  | Qualified of string * string
+  | No_namespace of string
+
+let matches_type_selector node selector =
+  let name = element_name_values node in
+  let local = String.lowercase_ascii name.local in
+  match selector with
+  | Universal -> true
+  | Name n -> local = String.lowercase_ascii n
+  | No_namespace n -> name.ns = "" && local = String.lowercase_ascii n
+  | Qualified (p, l) ->
+    let l = String.lowercase_ascii l in
+    begin match resolve_prefix node p with
+    | Some uri -> name.ns = uri && local = l
+    | None ->
+      match name.prefix with
+      | Some prefix ->
+        String.lowercase_ascii prefix = String.lowercase_ascii p && local = l
+      | None ->
+        (* HTML parsers keep colons in tag names, e.g. [<atom:link>]. *)
+        local = String.lowercase_ascii (p ^ ":" ^ l)
+    end
 
 type 'a nodes = {eliminate : 'b. ('b -> 'a node -> 'b) -> 'b -> 'b}
 
@@ -399,10 +623,15 @@ let is_root node =
 
 let tags name' node =
   let name' = String.lowercase_ascii name' in
+  let selector =
+    match split_qualified_name name' with
+    | None -> Name name'
+    | Some (prefix, local) -> Qualified (prefix, local)
+  in
   node
   |> descendants
   |> elements
-  |> filter (fun element -> name element = name')
+  |> filter (fun element -> matches_type_selector element selector)
 
 let tag name node = tags name node |> first
 
@@ -467,8 +696,6 @@ sig
   val matches_selector : t -> soup node -> soup node -> bool
 end =
 struct
-  type type_ = Name of string | Universal
-
   type attribute =
     | Present of string
     | Exactly of string * string
@@ -492,7 +719,7 @@ struct
     | Not of simple_selector
 
   and simple_selector =
-    | Type of type_
+    | Type of type_selector
     | Attribute of attribute
     | Pseudo_class of pseudo_class
 
@@ -608,8 +835,7 @@ struct
     | Not selector -> not (matches_simple_selector node selector)
 
   and matches_simple_selector node = function
-    | Type Universal -> true
-    | Type (Name name') -> name node = (String.lowercase_ascii name')
+    | Type type_selector -> matches_type_selector node type_selector
     | Attribute attribute_selector ->
       matches_attribute_selector node attribute_selector
     | Pseudo_class pseudo_class_selector ->
@@ -745,13 +971,13 @@ struct
     in
     loop ()
 
-  let parse_type_selector stream =
+  let parse_simple_type_selector stream =
     match Stream.peek stream with
-    | Some '*' -> Stream.junk stream; Universal
+    | Some '*' -> Stream.junk stream; `Universal
     | _ ->
       try
         let name = parse_identifier stream in
-        Name name
+        `Name name
       with _ -> parse_error "expected tag name or '*'"
 
   let parse_attribute_operator stream =
@@ -904,9 +1130,15 @@ struct
       | _ -> parse_error "unterminated '('")
     | _ -> parse_error "expected parenthesized expression"
 
-  let rec parse_pseudo_class_selector stream =
-    Stream.junk stream;
-    let function_ = parse_identifier stream in
+  (* Pseudo-classes known to Lambda Soup. A [:] followed by one of these after
+     a type selector is a pseudo-class; a [:] followed by any other identifier
+     forms a qualified (namespaced) type name such as [atom:link]. *)
+  let known_pseudo_classes =
+    ["root"; "first-child"; "last-child"; "first-of-type"; "last-of-type";
+     "only-child"; "only-of-type"; "nth-child"; "nth-of-type";
+     "nth-last-child"; "nth-last-of-type"; "contains"; "empty"; "has"; "not"]
+
+  let rec parse_pseudo_class_tail function_ stream =
     (match function_ with
     | "root" -> Root
     | "first-child" -> NthChild (0, 1)
@@ -941,24 +1173,78 @@ struct
       Printf.ksprintf parse_error
         "unknown pseudo-class or pseudo-element ':%s'" function_)
 
+  and parse_pseudo_class_selector stream =
+    Stream.junk stream;
+    let function_ = parse_identifier stream in
+    parse_pseudo_class_tail function_ stream
+
   and parse_simple_selector stream =
     match Stream.peek stream with
     | Some '[' -> Attribute (parse_attribute_selector stream)
     | Some ':' -> Pseudo_class (parse_pseudo_class_selector stream)
     | Some '.' -> Attribute (parse_class_selector stream)
     | Some '#' -> Attribute (parse_id_selector stream)
-    | Some _ -> Type (parse_type_selector stream)
+    | Some '|' ->
+      Stream.junk stream;
+      Type (No_namespace (parse_identifier stream))
+    | Some _ ->
+      begin match parse_simple_type_selector stream with
+      | `Universal -> Type Universal
+      | `Name prefix ->
+        match Stream.peek stream with
+        | Some '|' ->
+          Stream.junk stream;
+          Type (Qualified (prefix, parse_identifier stream))
+        | _ -> Type (Name prefix)
+      end
     | None -> parse_error "expected simple selector"
 
+  (* Parses a type selector in first position of a simple selector list,
+     including namespace forms ([prefix:local], [prefix|local], [|local],
+     [*|local]) and a type selector immediately followed by a pseudo-class
+     ([li:first-child]). *)
+  let parse_type_position_selectors stream =
+    match parse_simple_type_selector stream with
+    | `Universal ->
+      begin match Stream.peek stream with
+      | Some '|' ->
+        Stream.junk stream;
+        [Type (Name (parse_identifier stream))]
+      | _ -> [Type Universal]
+      end
+    | `Name prefix ->
+      match Stream.peek stream with
+      | Some '|' ->
+        Stream.junk stream;
+        [Type (Qualified (prefix, parse_identifier stream))]
+      | Some ':' ->
+        Stream.junk stream;
+        let ident = parse_identifier stream in
+        if List.mem ident known_pseudo_classes then
+          [Type (Name prefix);
+           Pseudo_class (parse_pseudo_class_tail ident stream)]
+        else
+          [Type (Qualified (prefix, ident))]
+      | _ -> [Type (Name prefix)]
+
   let parse_simple_selector_list stream =
-    let first = parse_simple_selector stream in
+    let first =
+      match Stream.peek stream with
+      | Some '|' ->
+        Stream.junk stream;
+        [Type (No_namespace (parse_identifier stream))]
+      | Some c when is_continuation_simple_selector_start_char c ->
+        [parse_simple_selector stream]
+      | Some _ -> parse_type_position_selectors stream
+      | None -> parse_error "expected simple selector"
+    in
     let rec loop selectors =
       match Stream.peek stream with
       | Some c when is_continuation_simple_selector_start_char c ->
         (parse_simple_selector stream)::selectors |> loop
       | _ -> List.rev selectors
     in
-    loop [first]
+    loop (List.rev first)
 
   let parse s =
     let stream = Stream.of_string s in
@@ -1009,6 +1295,19 @@ struct
   let ($$) = ($$)
 end
 
+(* Converts a stored name back to a Markup.ml expanded name. Names with a
+   namespace URI are emitted as (URI, local); [Markup.write_xml] then recovers
+   a prefix from the [xmlns] attributes in scope. Names without a URI but with
+   a prefix (e.g. unbound prefixes, or names created with [create_element])
+   are emitted with the prefix spelled into the local name, so that the
+   qualified spelling is preserved. *)
+let signal_name {ns; prefix; local} =
+  if ns <> "" then ns, local
+  else
+    match prefix with
+    | Some prefix -> "", prefix ^ ":" ^ local
+    | None -> "", local
+
 let signals root =
   let root = forget_type root in
 
@@ -1016,8 +1315,8 @@ let signals root =
     | {values = `Element {name; attributes; children}; _} ->
       let start_signal =
         `Start_element
-          (("http://www.w3.org/1999/xhtml", name),
-           List.map (fun (n, v) -> ("", n), v) attributes)
+          (signal_name name,
+           List.map (fun (n, v) -> signal_name n, v) attributes)
       in
       `End_element::(traverse_list (start_signal::acc) children)
 
@@ -1061,12 +1360,17 @@ let rec equal_general normalize_children n n' =
   in
 
   let equal_element values values' =
-      (values.name = values'.name)
+      (values.name.ns = values'.name.ns)
+    &&
+      (values.name.local = values'.name.local)
     &&
       begin
-        let sort =
-          List.sort (fun attr attr' -> compare (fst attr) (fst attr')) in
-        (sort values.attributes) = (sort values'.attributes)
+        let comparable attributes =
+          attributes
+          |> List.map (fun (name, value) -> (name.ns, name.local, value))
+          |> List.sort compare
+        in
+        (comparable values.attributes) = (comparable values'.attributes)
       end
     &&
       equal_children values.children values'.children
@@ -1208,24 +1512,44 @@ let prepend_root document node =
 
 let set_name new_name = function
   | {values = `Element e; _} ->
-    e.name <- new_name |> String.trim |> String.lowercase_ascii
+    let new_name = new_name |> String.trim |> String.lowercase_ascii in
+    begin match split_qualified_name new_name with
+    | Some (prefix, local) ->
+      e.name <- {e.name with prefix = Some prefix; local}
+    | None ->
+      e.name <- {e.name with prefix = None; local = new_name}
+    end
   | _ ->
     failwith "Soup.set_name: internal error: not an element" [@coverage off]
 
 let delete_attribute name = function
   | {values = `Element e; _} ->
     e.attributes <-
-      e.attributes |> List.filter (fun (name', _) -> name' <> name)
+      e.attributes |> List.filter (fun (name', _) ->
+        not (attribute_name_matches name name'))
   | _ ->
     failwith "Soup.delete_attribute: internal error: not an element"
       [@coverage off]
 
-let set_attribute name value = function
+let set_attribute name value node =
+  match node with
   | {values = `Element e; _} ->
+    let expanded =
+      match split_qualified_name name with
+      | Some (prefix, local) ->
+        let ns =
+          match resolve_prefix node prefix with
+          | Some uri -> uri
+          | None -> ""
+        in
+        {ns; prefix = Some prefix; local}
+      | None ->
+        {ns = ""; prefix = None; local = name}
+    in
     e.attributes <-
       e.attributes
-      |> List.filter (fun (name', _) -> name' <> name)
-      |> fun attributes -> (name, value)::attributes
+      |> List.filter (fun (name', _) -> not (attribute_name_matches name name'))
+      |> fun attributes -> (expanded, value)::attributes
   | _ ->
     failwith "Soup.set_attribute: internal error: not an element"
       [@coverage off]
@@ -1252,7 +1576,7 @@ let create_element ?id ?class_ ?classes ?(attributes = []) ?inner_text name =
     | Some s -> [create_text s]
   in
 
-  let element = create_element name [] children in
+  let element = create_element (expanded_name_of_string name) [] children in
 
   attributes |> List.iter (fun (n, v) -> set_attribute n v element);
 

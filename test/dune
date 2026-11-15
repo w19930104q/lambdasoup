@@ -1,9 +1,9 @@
 (executable
  (name test)
  (flags (:standard -w +A))
- (libraries lambdasoup ounit2))
+ (libraries lambdasoup markup ounit2))
 
 (rule
  (alias runtest)
- (deps (source_tree pages))
+ (deps (source_tree pages) (source_tree xml))
  (action (run %{exe:test.exe})))

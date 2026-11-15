@@ -123,7 +123,21 @@ val select : string -> (_ node) -> element nodes
 ::selection, ::before, ::after
 ]}
 
-    XML namespace selectors are not supported. Lambda Soup supports the canceled
+    XML namespace selectors are supported in the following forms:
+
+    - [atom:link] selects elements whose qualified name is [atom:link]. The
+      prefix is resolved against the document's [xmlns] declarations, so this
+      also matches elements that use a different prefix for the same
+      namespace URI. Note that an identifier after [:] that is a known
+      pseudo-class (such as [first-child]) is still parsed as a pseudo-class.
+    - [atom|link] is the equivalent CSS namespace syntax for [atom:link].
+    - [|link] selects [link] elements that are not in any namespace.
+    - A bare type selector such as [link] matches the local name [link] in
+      any namespace, per CSS rules for selectors without a declared default
+      namespace. This means [link] finds both RSS [<link>] and Atom
+      [<atom:link>] elements.
+
+    Lambda Soup supports the canceled
     {{:http://www.w3.org/TR/2001/CR-css3-selectors-20011113/#content-selectors}
     [:contains("foo")]} pseudo-class.
 
@@ -232,11 +246,34 @@ with_stop (fun stop ->
 
 val name : element node -> string
 (** The element's tag name. For example, an [<a>] element has tag name [a]. All
-    tag names are converted to lowercase. *)
+    tag names are converted to lowercase.
+
+    If the element's tag name had a namespace prefix in the source, as in
+    [<atom:link>], the name is the qualified name, i.e. ["atom:link"]. *)
+
+val namespace : element node -> string option
+(** The namespace URI of the element, if any. For example, after parsing an
+    Atom feed with [Markup.parse_xml] and {!from_signals}, the [<link>]
+    elements have namespace [Some "http://www.w3.org/2005/Atom"], whether they
+    were written with a prefix ([<atom:link>]) or in a default namespace
+    ([<feed xmlns="http://www.w3.org/2005/Atom">]).
+
+    Elements of HTML documents parsed with {!parse} are treated as having no
+    namespace, so [namespace] evaluates to [None] for them. *)
+
+val prefix : element node -> string option
+(** The namespace prefix of the element as it was written in the source, if
+    any. For example, an element written [<atom:link>] has prefix
+    [Some "atom"], while an element in a default namespace has prefix [None].
+    Use {!name} to get the qualified name ([prefix:local]) directly. *)
 
 val attribute : string -> element node -> string option
 (** [attribute attr element] retrieves the value of attribute [attr] from the
-    given element. *)
+    given element.
+
+    [attr] can be a plain attribute name such as ["href"], or a qualified name
+    such as ["xml:lang"] for an attribute that had a namespace prefix in the
+    source. *)
 
 val classes : element node -> string list
 (** The element's class list. For example, [<a class="foo bar">] has class list
@@ -527,7 +564,12 @@ val from_signals : (Markup.signal, Markup.sync) Markup.stream -> soup node
 Markup.string s |> Markup.parse_xml |> Markup.signals |> from_signals
 ]}
 
-    Namespaces are ignored at the moment. *)
+    Namespaces are preserved: each element and attribute keeps its namespace
+    URI and the prefix it was written with, which can be retrieved with
+    {!namespace}, {!prefix}, and {!name}, and matched with namespace-aware
+    CSS selectors (see {!select}). [xmlns] declarations are kept as ordinary
+    attributes, so serializing the document back with {!signals} and
+    [Markup.write_xml] produces namespace-equivalent output. *)
 
 
 
